@@ -1,0 +1,240 @@
+sudo mkdir -p ./data/
+sudo ./bin/mongod --dbpath ./data/db
+./bin/mongo
+use meebitsDB
+db.meebitsCollection
+db.salesCollection
+
+%matplotlib inline
+from helpers import parse_meebit_data, parse_sale_data
+import requests
+import pandas as pd
+
+import pymongo
+from pymongo import MongoClient
+import matplotlib
+import matplotlib.pyplot as plt
+plt.style.use('ggplot')
+
+client = MongoClient()
+db = client.meebitsDB
+meebits_collection = db.meebitsCollection
+sales_collection = db.salesCollection
+
+url = "https://api.opensea.io/api/v1/assets"
+
+for i in range(0, 400):
+    querystring = {"token_ids":list(range((i*50)+1, (i*50)+51)),
+                   "asset_contract_address":"0x7Bd29408f11D2bFC23c34f18275bBf23bB716Bc7",
+                   "order_direction":"desc",
+                   "offset":"0",
+                   "limit":"50"}
+    response = requests.request("GET", url, params=querystring)
+    
+    print(i, end=" ")
+    if response.status_code != 200:
+        print('error')
+        break
+    
+    #Getting meebits data
+    meebits = response.json()['assets']
+    #Parsing meebits data
+    parsed_meebits = [parse_meebit_data(meebit) for meebit in meebits]
+    #storing parsed meebits data into MongoDB
+    meebits_collection.insert_many(parsed_meebits)
+    
+    use meebitsDB
+
+db.getCollection('meebitsCollection').aggregate([ { 
+    $group: { 
+        _id: null, 
+        total: { 
+            $sum: "$num_sales" 
+        } 
+    } 
+} ] )
+
+url = "https://api.opensea.io/api/v1/events"
+
+for i in range(0, 100):
+
+    querystring = {"asset_contract_address":"0x7bd29408f11d2bfc23c34f18275bbf23bb716bc7",
+                   "event_type":"successful",
+                   "only_opensea":"true",
+                   "offset":i*50,
+                   "limit":"50"}
+
+    headers = {"Accept": "application/json"}
+
+    response = requests.request("GET", url, headers=headers, params=querystring)
+
+    
+    print(i, end=" ")
+    if response.status_code != 200:
+        print('error')
+        break
+    
+    #Getting meebits sales data
+    meebit_sales = response.json()['asset_events']
+
+    if meebit_sales == []:
+        break
+    
+    #Parsing meebits sales data
+    parsed_meebit_sales = [parse_sale_data(sale) for sale in meebit_sales]
+    #storing parsed meebits data into MongoDB
+    sales_collection.insert_many(parsed_meebit_sales)
+    
+meebits = meebits_collection.find()
+meebits_df = pd.DataFrame(meebits)
+
+meebit_sales = sales_collection.find()
+meebit_sales_df = pd.DataFrame(meebit_sales)
+print("The database has information about %d Meebits." % len(meebits_df))
+print("The database has information about %d Meebits sale transactions." % len(meebit_sales_df))
+
+creators = []
+for creator_address in meebits_df['creator_address'].value_counts().index[:10]:
+    creator_data = {}
+    creator_data['creator_address'] = creator_address
+    creator_data['creator_username'] = meebits_df[meebits_df['creator_address'] == creator_address]['creator_username'].iloc[0]
+    creator_data['number_meebits'] = len(meebits_df[meebits_df['creator_address'] == creator_address])
+    creators.append(creator_data)
+
+pd.DataFrame(creators)
+
+#### Getting total number of Meebit Creators and Owners.
+print("There are %d unique Meebit creators." % len(meebits_df['creator_address'].unique()))
+print("There are %d unique Meebit owners." % len(meebits_df['owner_address'].unique()))
+
+meebit_sales_df['is_bundle'].value_counts()
+meebit_sales_df[meebit_sales_df['is_bundle'] == False]['payment_token'].value_counts()
+
+meebit_sales_df = meebit_sales_df[(meebit_sales_df['payment_token'] != 'USDC') & (meebit_sales_df['is_bundle'] == False)].copy()
+# Parsing dates
+meebit_sales_df['timestamp'] = pd.to_datetime(meebit_sales_df['timestamp'])
+# Converting sales price from WEI to ETH
+meebit_sales_df['total_price'] = meebit_sales_df['total_price']/10.**18
+# Calculating the sale prices in USD
+meebit_sales_df['total_price_usd'] = meebit_sales_df['total_price'] * meebit_sales_df['usd_price']
+
+
+data = meebit_sales_df[['timestamp', 'total_price']].resample('D', on='timestamp').count()['total_price']
+ax = data.plot.bar(figsize=(18, 6))
+
+ax.set_alpha(0.8)
+ax.set_title("Number of Meebits Sales per Day", fontsize=18)
+ax.set_ylabel("Number of Meebits Sales", fontsize=18)
+
+#https://github.com/pandas-dev/pandas/issues/1918
+plt.gca().xaxis.set_major_formatter(plt.FixedFormatter(data.index.to_series().dt.strftime("%d %b %Y")))
+
+#https://robertmitchellv.com/blog-bar-chart-annotations-pandas-mpl.html
+for i in ax.patches:
+    # get_x pulls left or right; get_height pushes up or down
+    ax.text(i.get_x(), i.get_height()+40, \
+            str(round((i.get_height()), 2)), fontsize=11, color='dimgrey',
+                rotation=45)
+                
+                
+                data = meebit_sales_df[['timestamp', 'total_price']].resample('D', on='timestamp').sum()['total_price']
+ax = data.plot(figsize=(18,6), color="red", linewidth=1, marker='o', markerfacecolor='grey', markeredgewidth=0)
+
+ax.set_alpha(0.8)
+ax.set_title("Timeline of Total Meebit Sales in ETH", fontsize=18)
+ax.set_ylabel("Sales in ETH", fontsize=18);
+
+dates = list(data.index)
+values = list(data.values)
+
+for i, j in zip(dates, values):
+    ax.annotate(s="{:.0f}".format(j), xy=(i, j+200), rotation=45)
+    
+    
+    data = meebit_sales_df[['timestamp', 'total_price_usd']].resample('D', on='timestamp').sum()['total_price_usd']
+ax = data.plot(figsize=(18,6), color="red", linewidth=1, marker='o', markerfacecolor='grey', markeredgewidth=0)
+
+ax.set_alpha(0.8)
+ax.set_title("Timeline of Total Meebit Sales in Million USD", fontsize=18)
+ax.set_ylabel("Sales in Million USD", fontsize=18);
+
+dates = list(data.index)
+values = list(data.values)
+
+for i, j in zip(dates, values):
+    ax.annotate(s="{:.2f}".format(j/10.**6), xy=(i, j), rotation=45)
+    
+    
+    data = meebit_sales_df[['timestamp', 'total_price']].resample('D', on='timestamp').mean()['total_price']
+ax = data.plot(figsize=(18,6), color="green", linewidth=1, marker='o', markerfacecolor='grey', markeredgewidth=0)
+
+ax.set_alpha(0.8)
+ax.set_title("Timeline of Average Meebit Price in ETH", fontsize=18)
+ax.set_ylabel("Average Price in ETH", fontsize=18);
+#ax.annotate(s='sdsdsds', xy=(1, 1))
+
+dates = list(data.index)
+values = list(data.values)
+
+for i, j in zip(dates, values):
+    ax.annotate(s="{:.2f}".format(j), xy=(i, j+.2), rotation=45)
+    
+    data = meebit_sales_df[['timestamp', 'total_price']].resample('D', on='timestamp').min()['total_price']
+ax = data.plot(figsize=(18,6), color="orange", linewidth=1, marker='o', markerfacecolor='grey', markeredgewidth=0)
+
+ax.set_alpha(0.8)
+ax.set_title("Timeline of Floor Meebit Price in ETH", fontsize=18)
+ax.set_ylabel("Floor Price in ETH", fontsize=18);
+
+dates = list(data.index)
+values = list(data.values)
+
+for d, v in zip(dates, values):
+    ax.annotate(s="{:.2f}".format(v), xy=(d, v), rotation=45)
+    
+    data = meebit_sales_df[['timestamp', 'total_price']].resample('D', on='timestamp').max()['total_price']
+ax = data.plot(figsize=(18,6), color="red", linewidth=1, marker='o', markerfacecolor='grey', markeredgewidth=0)
+
+ax.set_alpha(0.8)
+ax.set_title("Timeline of Max Meebit Price in ETH", fontsize=18)
+ax.set_ylabel("Max Price in ETH", fontsize=18);
+
+dates = list(data.index)
+values = list(data.values)
+
+for i, j in zip(dates, values):
+    ax.annotate(s="{:.0f}".format(j), xy=(i, j+30), rotation=45)
+    
+    print("There are %d unique Meebit sellers." % len(meebit_sales_df['seller_address'].unique()))
+print("There are %d unique Meebit buyers." % len(meebit_sales_df['buyer_address'].unique()))
+
+buyers = []
+for buyer_address in meebit_sales_df['buyer_address'].value_counts().index[:10]:
+    buyer_data = {}
+    buyer_data['buyer_address'] = buyer_address
+    buyer_data['buyer_username'] = meebit_sales_df[meebit_sales_df['buyer_address'] == buyer_address]['buyer_username'].iloc[0]
+    buyer_data['number_buys'] = len(meebit_sales_df[meebit_sales_df['buyer_address'] == buyer_address])
+    buyer_data['min_price'] = meebit_sales_df[meebit_sales_df['buyer_address'] == buyer_address]['total_price'].min()
+    buyer_data['max_price'] = meebit_sales_df[meebit_sales_df['buyer_address'] == buyer_address]['total_price'].max()
+    buyer_data['mean_price'] = meebit_sales_df[meebit_sales_df['buyer_address'] == buyer_address]['total_price'].mean()
+    buyers.append(buyer_data)
+    
+pd.DataFrame(buyers)
+
+sellers = []
+for seller_address in meebit_sales_df['seller_address'].value_counts().index[:10]:
+    seller_data = {}
+    seller_data['seller_address'] = seller_address
+    seller_data['seller_username'] = meebit_sales_df[meebit_sales_df['seller_address'] == seller_address]['seller_username'].iloc[0]
+    seller_data['number_sales'] = len(meebit_sales_df[meebit_sales_df['seller_address'] == seller_address])
+    seller_data['min_price'] = meebit_sales_df[meebit_sales_df['seller_address'] == seller_address]['total_price'].min()
+    seller_data['max_price'] = meebit_sales_df[meebit_sales_df['seller_address'] == seller_address]['total_price'].max()
+    seller_data['mean_price'] = meebit_sales_df[meebit_sales_df['seller_address'] == seller_address]['total_price'].mean()
+    sellers.append(seller_data)
+    
+pd.DataFrame(sellers)
+
+top_10_buyers = meebit_sales_df['buyer_address'].value_counts().index[:10]
+top_10_sellers = meebit_sales_df['seller_address'].value_counts().index[:10]
+print(list(set(top_10_buyers) & set(top_10_sellers)))
+
